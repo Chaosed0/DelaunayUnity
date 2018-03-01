@@ -8,23 +8,34 @@ public class DelaunayTerrain : MonoBehaviour {
     public int xsize = 50;
     public int ysize = 50;
 
+    // Minimum distance the poisson-disc-sampled points are from each other.
+    public float minPointRadius = 4.0f;
+
     // Number of random points to generate.
-    public int randomPoints = 1000;
+    public int randomPoints = 100;
 
     // Triangles in each chunk.
     public int trianglesInChunk = 20000;
 
     // Perlin noise parameters
+    public float elevationScale = 100.0f;
     public float sampleSize = 1.0f;
     public int octaves = 8;
     public float frequencyBase = 2;
     public float persistence = 1.1f;
+
+    // Detail mesh parameters
+    public Transform detailMesh;
+    public int detailMeshesToGenerate = 50;
 
     // Prefab which is generated for each chunk of the mesh.
     public Transform chunkPrefab = null;
 
     // Elevations at each point in the mesh
     private List<float> elevations;
+    
+    // Fast triangle querier for arbitrary points
+    private TriangleBin bin;
 
     // The delaunay mesh
     private TriangleNet.Mesh mesh = null;
@@ -44,14 +55,25 @@ public class DelaunayTerrain : MonoBehaviour {
         for (int i = 0; i < octaves; i++) {
             seed[i] = Random.Range(0.0f, 100.0f);
         }
+        
+        PoissonDiscSampler sampler = new PoissonDiscSampler(xsize, ysize, minPointRadius);
 
         Polygon polygon = new Polygon();
+
+        // Add uniformly-spaced points
+        foreach (Vector2 sample in sampler.Samples()) {
+            polygon.Add(new Vertex((double)sample.x, (double)sample.y));
+        }
+
+        // Add some randomly sampled points
         for (int i = 0; i < randomPoints; i++) {
             polygon.Add(new Vertex(Random.Range(0.0f, xsize), Random.Range(0.0f, ysize)));
         }
 
         TriangleNet.Meshing.ConstraintOptions options = new TriangleNet.Meshing.ConstraintOptions() { ConformingDelaunay = true };
         mesh = (TriangleNet.Mesh)polygon.Triangulate(options);
+        
+        bin = new TriangleBin(mesh, xsize, ysize, minPointRadius * 2.0f);
 
         // Sample perlin noise to get elevations
         foreach (Vertex vert in mesh.Vertices) {
@@ -70,12 +92,13 @@ public class DelaunayTerrain : MonoBehaviour {
             }
 
             elevation = elevation / maxVal;
-            elevations.Add(elevation);
+            elevations.Add(elevation * elevationScale);
         }
 
         MakeMesh();
-    }
 
+        ScatterDetailMeshes();
+    }
     
     public void MakeMesh() {
         IEnumerator<Triangle> triangleEnumerator = mesh.Triangles.GetEnumerator();
@@ -131,12 +154,71 @@ public class DelaunayTerrain : MonoBehaviour {
         }
     }
 
-
-    // Equivalent to calling new Vector3(GetPointLocation(i).x, GetElevation(i), GetPointLocation(i).y)
+    /* Returns a point's local coordinates. */
     public Vector3 GetPoint3D(int index) {
         Vertex vertex = mesh.vertices[index];
         float elevation = elevations[index];
         return new Vector3((float)vertex.x, elevation, (float)vertex.y);
+    }
+    
+    /* Returns the triangle containing the given point. If no triangle was found, then null is returned.
+       The list will contain exactly three point indices. */
+    public List<int> GetTriangleContainingPoint(Vector2 point) {
+        Triangle triangle = bin.getTriangleForPoint(new Point(point.x, point.y));
+        if (triangle == null) {
+            return null;
+        }
+
+        return new List<int>(new int[] { triangle.vertices[0].id, triangle.vertices[1].id, triangle.vertices[2].id });
+    }
+
+    /* Returns a pretty good approximation of the height at a given point in worldspace */
+    public float GetElevation(float x, float y) {
+        if (x < 0 || x > xsize ||
+                y < 0 || y > ysize) {
+            return 0.0f;
+        }
+
+        Vector2 point = new Vector2(x, y);
+        List<int> triangle = GetTriangleContainingPoint(point);
+
+        if (triangle == null) {
+            // This can happen sometimes because the triangulation does not actually fit entirely within the bounds of the grid;
+            // not great error handling, but let's return an invalid value
+            return float.MinValue;
+        }
+
+        Vector3 p0 = GetPoint3D(triangle[0]);
+        Vector3 p1 = GetPoint3D(triangle[1]);
+        Vector3 p2 = GetPoint3D(triangle[2]);
+
+        Vector3 normal = Vector3.Cross(p0 - p1, p1 - p2).normalized;
+        float elevation = p0.y + (normal.x * (p0.x - x) + normal.z * (p0.z - y)) / normal.y;
+
+        return elevation;
+    }
+
+    /* Scatters detail meshes within the bounds of the terrain. */
+    public void ScatterDetailMeshes() {
+        for (int i = 0; i < detailMeshesToGenerate; i++)
+        {
+            // Obtain a random position
+            float x = Random.Range(0, xsize);
+            float z = Random.Range(0, ysize);
+            float elevation = GetElevation(x, z);
+            Vector3 position = new Vector3(x, elevation, z);
+
+            if (elevation == float.MinValue) {
+                // Value returned when we couldn't find a triangle, just skip this one
+                continue;
+            }
+
+            // We always want the mesh to remain upright, so only vary the rotation in the x-z plane
+            float angle = Random.Range(0, 360.0f);
+            Quaternion randomRotation = Quaternion.AngleAxis(angle, Vector3.up);
+
+            Instantiate<Transform>(detailMesh, position, randomRotation, this.transform);
+        }
     }
 
     public void OnDrawGizmos() {
